@@ -1,0 +1,20 @@
+FROM ubuntu:20.04
+
+RUN DEBIAN_FRONTEND="noninteractive" apt-get update && apt-get -y install tzdata
+
+RUN apt update && apt install -y \
+    cmake \
+    g++ \
+    wget \
+    unzip \
+    build-essential \
+    git
+
+RUN wget -O opencv.zip https://github.com/opencv/opencv/archive/master.zip \
+    && unzip opencv.zip
+
+RUN cd opencv-master \
+    && mkdir -p build \
+    && cd build \
+    && cmake .. \
+    && make -j8 install
