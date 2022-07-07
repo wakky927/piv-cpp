@@ -38,38 +38,40 @@ class KC(object):
 
     """
 
-    def __init__(self, img_path, out_path, filename, n):
+    def __init__(self, img_path, out_path, filename, fmt, n):
         self.img_path = img_path
         self.out_path = out_path
         self.filename = filename
+        self.fmt = fmt
         self.n = n
 
     def run(self):
-        for i in range(0, self.n):  # 1~n -> range(1, self.n + 1)
+        for i in range(1, self.n+1):  # 0 ~ n-1 -> range(0, self.n)
             # read img
-            img_a = cv2.imread(self.img_path + self.filename + f"{i}.bmp", 0)  # 00000i -> {i:06}, 0000000i -> {i:08}
-            img_b = cv2.imread(self.img_path + self.filename + f"{i + 1}.bmp", 0)
+            img_a = cv2.imread(f"{self.img_path}{self.filename}{i}.{self.fmt}", 0)  # 00000i -> {i:06}
+            img_b = cv2.imread(f"{self.img_path}{self.filename}{i+1}.{self.fmt}", 0)
 
             # std piv (cross-correlation)
-            G_dY, G_dX = self.std_piv(
+            G_Y, G_X, G_dY, G_dX = self.std_piv(
                 img_a=img_a,
                 img_b=img_b,
                 grid_nums=(65, 65),
                 win_sizes=(16, 16),
                 search_win_sizes=(10, 10),
-                threshold=0.7
+                threshold=0.5
             )
 
             # pmc
-            particle_position = self.pmc(img=img_a)
+            particle_position = self.pmc(img=img_a, threshold=0.5)
 
             # interpolation
-            P_dYdX = self.interpolate_vectors(G_dY=G_dY, G_dX=G_dX, pp=particle_position)
+            P_dYdX = self.interpolate_vectors(G_Y=G_Y, G_X=G_X, G_dY=G_dY, G_dX=G_dX, pp=particle_position)
 
             # KC method
-            result = self.kc_method()
+            result = self.kc_method(pp=particle_position, P_dYdX=P_dYdX)
 
-            return result
+            # save result
+            np.savetxt(f"{self.out_path}{self.filename}{i}.csv", result, delimiter=',', header="y, x, dY, dX")
 
     @staticmethod
     def std_piv(img_a, img_b, grid_nums, win_sizes, search_win_sizes, threshold=0.7):
@@ -81,7 +83,7 @@ class KC(object):
         :param win_sizes: [tuple(int, int)] window sizes: (H, W) -> 2H * 2W
         :param search_win_sizes: [tuple(int, int)] search window sizes: (S_Y, S_X) -> H + S_Y, W + S_X
         :param threshold: [float] threshold (default 0.7)
-        :return: dY, dX: [2D ndarray (float), 2D ndarray (float)]: displacements
+        :return: Y, X, dY, dX: [2D ndarray, 2D ndarray, 2D ndarray, 2D ndarray]: displacements
         """
         height, width = img_a.shape
 
@@ -142,7 +144,7 @@ class KC(object):
                     dX[y, x] = np.nan
                     dY[y, x] = np.nan
 
-        return dY, dX
+        return Y, X, dY, dX
 
     @staticmethod
     def pmc(img, threshold=0.7):
@@ -179,7 +181,7 @@ class KC(object):
 
             return np.unique(res[1:, :], axis=0)  # Exclude duplicates just in case...
 
-        tracer_img = np.zeros((15, 15), dtype=np.uint8)
+        tracer_img = np.zeros((9, 9), dtype=np.uint8)
         tracer_img = gauss_circle(image=tracer_img, sd=2)
 
         c = cv2.matchTemplate(img, tracer_img, cv2.TM_CCORR_NORMED)
@@ -190,24 +192,28 @@ class KC(object):
         return p_yx
 
     @staticmethod
-    def interpolate_vectors(G_dY, G_dX, pp):
+    def interpolate_vectors(G_Y, G_X, G_dY, G_dX, pp):
         """
-
-        :param G_dY: [2D ndarray (float)] y-component of velocity field by PIV
-        :param G_dX: [2D ndarray (float)] x-component of velocity field by PIV
-        :param pp: [2D ndarray (float)] particle position
-        :return: [2D ndarray (float)] estimated particle displacement
+        Interpolation vectors of particle displacement
+        :param G_Y: [2D ndarray] y-coordinates
+        :param G_X: [2D ndarray] x-coordinates
+        :param G_dY: [2D ndarray] y-component of velocity field by PIV
+        :param G_dX: [2D ndarray] x-component of velocity field by PIV
+        :param pp: [2D ndarray] particle position
+        :return: [2D ndarray] estimated particle displacement
 
         [Coordinates]
 
-            ----X   G_0(X, Y)          G_1(X+1, Y)
-            |       --------------------
-            Y       |                  |
-                    |        * p(x, y) |
-                    |                  |
-                    |                  |
-                    --------------------
-                    G_3(X, Y+1)        G_2(X+1, Y+1)
+            ----I
+            |       (I, J) = (X_G0, Y_G0)  (I+1, J) = (X_G1, Y_G1)
+            J             O--------------------O
+                          |                    |
+                          |        * p(x, y)   |
+                          |                    |
+                          |                    |
+                          |                    |
+                          O--------------------O
+                    (I, J+1) = (X_G3, Y_G3)  (I+1, J+1) = (X_G2, Y_G2)
 
         """
         def w(a, b, sigma):
@@ -217,24 +223,44 @@ class KC(object):
         p = 0
 
         for y, x in pp:
-            G_0_Y = math.floor(y)
-            G_0_X = math.floor(x)
+            # init weight
             W = 0
 
-            for j in range(1, 2):
-                for i in range(1, 2):
-                    p_dydx[p, 0] += G_dY[G_0_Y+j, G_0_X+i] * w(a=G_0_X+i-x, b=G_0_Y+j-y, sigma=0.5)
-                    p_dydx[p, 1] += G_dX[G_0_Y+j, G_0_X+i] * w(a=G_0_X+i-x, b=G_0_Y+j-y, sigma=0.5)
-                    W += w(a=G_0_X+i-x, b=G_0_Y+j-y, sigma=0.5)
+            # get x-y coordinates
+            X, Y = G_X[0, :], G_Y[:, 0]
 
-            p_dydx[p] /= W
+            # get (I, J)
+            I = np.where(X == X[(X <= x)].max())[0]
+            J = np.where(Y == Y[(Y <= y)].max())[0]
+
+            # interpolation
+            for j in range(0, 2):
+                for i in range(0, 2):
+                    if np.isnan(G_dX[J+j, I+i]) or np.isnan(G_dY[J+j, I+i]):
+                        pass
+                    else:
+                        p_dydx[p, 0] += G_dY[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
+                        p_dydx[p, 1] += G_dX[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
+                        W += w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
+
+            if W == 0:
+                p_dydx[p] = np.nan
+            else:
+                p_dydx[p] /= W
+
             p += 1
 
         return p_dydx
 
-    def kc_method(self):
-        pass
+    @staticmethod
+    def kc_method(pp, P_dYdX):
+        r = np.hstack([pp, P_dYdX])
+
+        return r
 
 
 if __name__ == '__main__':
-    pass
+    kc = KC(img_path="../data/std-piv-imgs/", out_path="../data/kc-test/", filename="piv_", fmt="bmp", n=2)
+    kc.run()
+
+    print(0)
