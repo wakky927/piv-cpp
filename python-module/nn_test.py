@@ -1,5 +1,6 @@
 from decimal import Decimal, ROUND_HALF_UP
 
+
 import cv2
 import numpy as np
 from scipy.stats import norm
@@ -7,8 +8,6 @@ from scipy.stats import norm
 
 class KC(object):
     """
-    [URL] https://doi.org/10.1007/s003480070005
-
     [Flow Chart]
 
                      [Particle image]
@@ -20,8 +19,8 @@ class KC(object):
          Correlation PIV]             Correlation Method]
              |                               |
              V                               V
-        [Regular Grid                [Individual Particle
-         Velocity Field]              Image Information  ]
+        [Regular Grid                [Post processing]
+         Velocity Field]                     |
              |                               |
              ---------------------------------
                              |
@@ -30,7 +29,7 @@ class KC(object):
               Vectors for Each Particle        ]
                              |
                              V
-                    [Modified KC Method]
+                    [nearest-neighbor Method]
                              |
                              V
                          [Results]
@@ -45,32 +44,56 @@ class KC(object):
         self.n = n
 
     def run(self):
-        for i in range(1, self.n+1):  # 0 ~ n-1 -> range(0, self.n)
+        for i in range(1, self.n):  # 0 ~ n-1 -> range(0, self.n)
             # read img
             img_a = cv2.imread(f"{self.img_path}{self.filename}{i}.{self.fmt}", 0)  # 00000i -> {i:06}
             img_b = cv2.imread(f"{self.img_path}{self.filename}{i+1}.{self.fmt}", 0)
 
             # std piv (cross-correlation)
-            G_Y, G_X, G_dY, G_dX = self.std_piv(
+            G_X, G_Y, G_dX, G_dY = self.std_piv(
                 img_a=img_a,
                 img_b=img_b,
-                grid_nums=(65, 65),
+                grid_nums=(32, 65),
                 win_sizes=(16, 16),
-                search_win_sizes=(10, 10),
-                threshold=0.5
+                search_win_sizes=(8, 8),
+                threshold=0.
             )
 
+            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_x.csv", G_X, delimiter=',')
+            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_y.csv", G_Y, delimiter=',')
+            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx.csv", G_dX, delimiter=',')
+            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy.csv", G_dY, delimiter=',')
+
             # pmc
-            particle_position = self.pmc(img=img_a, threshold=0.5)
+            particle_position_a = self.pmc(img=img_a, threshold=0.5)
+            particle_position_b = self.pmc(img=img_b, threshold=0.5)
+
+            img_a_2 = np.zeros_like(img_a)
+            img_b_2 = np.zeros_like(img_b)
+
+            for s, t in zip(particle_position_a[:, 0].astype(int), particle_position_a[:, 1].astype(int)):
+                img_a_2[t, s] = 255
+            for s, t in zip(particle_position_a[:, 0].astype(int), particle_position_a[:, 1].astype(int)):
+                img_b_2[t, s] = 255
+
+            cv2.imwrite(f"{self.out_path}{self.filename}{i}.bmp", img_a_2)
+            cv2.imwrite(f"{self.out_path}{self.filename}{i+1}.bmp", img_b_2)
 
             # interpolation
-            P_dYdX = self.interpolate_vectors(G_Y=G_Y, G_X=G_X, G_dY=G_dY, G_dX=G_dX, pp=particle_position)
+            P_dXdY = self.interpolate_vectors(G_X=G_X, G_Y=G_Y, G_dX=G_dX, G_dY=G_dY, pp=particle_position_a)
 
-            # KC method
-            result = self.kc_method(pp=particle_position, P_dYdX=P_dYdX)
+            img_a_b = np.zeros_like(img_a)
+            pp = particle_position_a + P_dXdY
+            for s, t in zip(pp[:, 0].astype(int), pp[:, 1].astype(int)):
+                if 0 <= s < 256 and 0 <= t < 256:
+                    img_a_b[t, s] = 255
+            cv2.imwrite(f"{self.out_path}{self.filename}{i+1}_pred.bmp", img_a_b)
+
+            # nearest-neighbor method
+            result = self.nn_method(pp_a=particle_position_a, pp_b=particle_position_b, P_dXdY=P_dXdY)
 
             # save result
-            np.savetxt(f"{self.out_path}{self.filename}{i}.csv", result, delimiter=',', header="y, x, dY, dX")
+            np.savetxt(f"{self.out_path}{self.filename}{i}.csv", result, delimiter=',', header="x, y, dX, dY")
 
     @staticmethod
     def std_piv(img_a, img_b, grid_nums, win_sizes, search_win_sizes, threshold=0.7):
@@ -143,7 +166,7 @@ class KC(object):
                     dX[y, x] = np.nan
                     dY[y, x] = np.nan
 
-        return Y, X, dY, dX
+        return X, Y, dX, dY
 
     @staticmethod
     def pmc(img, threshold=0.7):
@@ -176,28 +199,28 @@ class KC(object):
                         eps_x = float(Decimal(str(eps_x)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
                         eps_y = float(Decimal(str(eps_y)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP))
 
-                        res = np.vstack([res, [j + eps_y + t_size[0] // 2, i + eps_x + t_size[1] // 2]])
+                        res = np.vstack([res, [i + eps_x + t_size[1] // 2, j + eps_y + t_size[0] // 2]])
 
             return np.unique(res[1:, :], axis=0)  # Exclude duplicates just in case...
 
-        tracer_img = np.zeros((9, 9), dtype=np.uint8)
+        tracer_img = np.zeros((15, 15), dtype=np.uint8)
         tracer_img = gauss_circle(image=tracer_img, sd=2)
 
         c = cv2.matchTemplate(img, tracer_img, cv2.TM_CCORR_NORMED)
         c_j, c_i = np.where(c > threshold)
 
-        p_yx = sub_pixel_analysis(ji=[c_j, c_i], cc=c, t_size=tracer_img.shape)
+        p_xy = sub_pixel_analysis(ji=[c_j, c_i], cc=c, t_size=tracer_img.shape)
 
-        return p_yx
+        return p_xy
 
     @staticmethod
-    def interpolate_vectors(G_Y, G_X, G_dY, G_dX, pp):
+    def interpolate_vectors(G_X, G_Y, G_dX, G_dY, pp):
         """
         Interpolation vectors of particle displacement
-        :param G_Y: [2D ndarray] y-coordinates
         :param G_X: [2D ndarray] x-coordinates
-        :param G_dY: [2D ndarray] y-component of velocity field by PIV
+        :param G_Y: [2D ndarray] y-coordinates
         :param G_dX: [2D ndarray] x-component of velocity field by PIV
+        :param G_dY: [2D ndarray] y-component of velocity field by PIV
         :param pp: [2D ndarray] particle position
         :return: [2D ndarray] estimated particle displacement
 
@@ -218,10 +241,10 @@ class KC(object):
         def w(a, b, sigma):
             return np.exp(-(a**2 + b**2) / sigma**2)
 
-        p_dydx = np.zeros_like(pp)
+        p_dxdy = np.zeros_like(pp)
         p = 0
 
-        for y, x in pp:
+        for x, y in pp:
             # init weight
             W = 0
 
@@ -238,28 +261,97 @@ class KC(object):
                     if np.isnan(G_dX[J+j, I+i]) or np.isnan(G_dY[J+j, I+i]):
                         pass
                     else:
-                        p_dydx[p, 0] += G_dY[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
-                        p_dydx[p, 1] += G_dX[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
+                        p_dxdy[p, 0] += G_dX[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
+                        p_dxdy[p, 1] += G_dY[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
                         W += w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
 
             if W == 0:
-                p_dydx[p] = np.nan
+                p_dxdy[p] = np.nan
             else:
-                p_dydx[p] /= W
+                p_dxdy[p] /= W
 
             p += 1
 
-        return p_dydx
+        return p_dxdy
 
     @staticmethod
-    def kc_method(pp, P_dYdX):
-        r = np.hstack([pp, P_dYdX])
+    def nn_method(pp_a, pp_b, P_dXdY, s=5):
+        class Vector2D(object):
+            def __init__(self):
+                self.x = 0.0
+                self.y = 0.0
 
-        return r
+        class TP(object):
+            def __init__(self, idx):
+                self.idx = idx
+                self.p0 = 0
+                self.p1 = 0
+                self.err = 0.0
+                self.flag = False
+
+        if pp_a is None or pp_b is None:
+            return None
+
+        pp_b_prod = pp_a + P_dXdY
+        result = np.zeros([pp_a.shape[0], 4])
+
+        dx = Vector2D
+        pp01 = [TP(idx=x) for x in range(pp_a.shape[0])]
+        npa = -1  # the number of available particle
+        ntsp = 0  # the number for tracking the same particle
+
+        for ii in range(pp_a.shape[0]):  # 1st
+            flag = True  # init flag for the particle tracking
+            c, cc = 1e10, 1e10  # arbitrary large number
+
+            for jj in range(pp_b.shape[0]):  # 2nd
+                dx.x = pp_b[jj][0] - pp_b_prod[ii][0]
+                dx.y = pp_b[jj][1] - pp_b_prod[ii][1]
+
+                cc = np.sqrt(dx.x ** 2 + dx.y ** 2)
+
+                if cc <= s and cc < c:
+                    c = cc
+
+                    if flag:
+                        npa += 1
+
+                    pp01[npa].p0 = ii
+                    pp01[npa].p1 = jj
+                    pp01[npa].err = c
+                    pp01[npa].flag = True
+                    flag = False
+
+        # post-processing
+        # If different particles track the same particle,
+        # giving an error flag to particle which has larger error.
+        for ii in range(npa):
+            if pp01[ii].flag:
+                for jj in range(ii + 1, npa):
+                    if pp01[ii].p1 == pp01[jj].p1:
+                        if pp01[ii].err > pp01[jj].err:
+                            pp01[ii].flag = False
+                            ntsp += 1
+                            break
+                        else:
+                            pp01[jj].flag = False
+                            ntsp += 1
+
+        for ii in range(npa+1):
+            if pp01[ii].flag:
+                result[ii][0] = pp_a[pp01[ii].p0][0]
+                result[ii][1] = pp_a[pp01[ii].p0][1]
+                result[ii][2] = pp_b[pp01[ii].p1][0] - pp_a[pp01[ii].p0][0]
+                result[ii][3] = pp_b[pp01[ii].p1][1] - pp_a[pp01[ii].p0][1]
+
+        if npa == 0:
+            return result
+
+        return result[:npa]
 
 
 if __name__ == '__main__':
-    kc = KC(img_path="../data/std-piv-imgs/", out_path="../data/kc_test/", filename="piv_", fmt="bmp", n=2)
+    kc = KC(img_path="../data/test/in/", out_path="../data/test/out/", filename="", fmt="png", n=2)
     kc.run()
 
     print(0)
