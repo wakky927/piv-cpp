@@ -1,6 +1,5 @@
 from decimal import Decimal, ROUND_HALF_UP
 
-
 import cv2
 import numpy as np
 from scipy.stats import norm
@@ -47,7 +46,12 @@ class KC(object):
         for i in range(1, self.n):  # 0 ~ n-1 -> range(0, self.n)
             # read img
             img_a = cv2.imread(f"{self.img_path}{self.filename}{i}.{self.fmt}", 0)  # 00000i -> {i:06}
-            img_b = cv2.imread(f"{self.img_path}{self.filename}{i+1}.{self.fmt}", 0)
+            img_b = cv2.imread(f"{self.img_path}{self.filename}{i + 1}.{self.fmt}", 0)
+
+            # pre-processing
+
+            # gauss blur  TODO
+            # high-pass filter  TODO
 
             # std piv (cross-correlation)
             G_X, G_Y, G_dX, G_dY = self.std_piv(
@@ -64,6 +68,9 @@ class KC(object):
             np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx.csv", G_dX, delimiter=',')
             np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy.csv", G_dY, delimiter=',')
 
+            # post-processing
+            self.post()
+
             # pmc
             particle_position_a = self.pmc(img=img_a, threshold=0.5)
             particle_position_b = self.pmc(img=img_b, threshold=0.5)
@@ -77,7 +84,7 @@ class KC(object):
                 img_b_2[t, s] = 255
 
             cv2.imwrite(f"{self.out_path}{self.filename}{i}.bmp", img_a_2)
-            cv2.imwrite(f"{self.out_path}{self.filename}{i+1}.bmp", img_b_2)
+            cv2.imwrite(f"{self.out_path}{self.filename}{i + 1}.bmp", img_b_2)
 
             # interpolation
             P_dXdY = self.interpolate_vectors(G_X=G_X, G_Y=G_Y, G_dX=G_dX, G_dY=G_dY, pp=particle_position_a)
@@ -87,7 +94,7 @@ class KC(object):
             for s, t in zip(pp[:, 0].astype(int), pp[:, 1].astype(int)):
                 if 0 <= s < 256 and 0 <= t < 256:
                     img_a_b[t, s] = 255
-            cv2.imwrite(f"{self.out_path}{self.filename}{i+1}_pred.bmp", img_a_b)
+            cv2.imwrite(f"{self.out_path}{self.filename}{i + 1}_pred.bmp", img_a_b)
 
             # nearest-neighbor method
             result = self.nn_method(pp_a=particle_position_a, pp_b=particle_position_b, P_dXdY=P_dXdY)
@@ -115,14 +122,16 @@ class KC(object):
                          width + 2 * (search_win_sizes[1] + win_sizes[1]))).astype(np.uint8)
 
         img1[search_win_sizes[0] + win_sizes[0]:search_win_sizes[0] + win_sizes[0] + height,
-             search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_a
+        search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_a
         img2[search_win_sizes[0] + win_sizes[0]:search_win_sizes[0] + win_sizes[0] + height,
-             search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_b
+        search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_b
 
         X, Y = np.meshgrid(np.linspace(0, width, grid_nums[1], dtype="int"),
                            np.linspace(0, height, grid_nums[0], dtype="int"))
         dX = np.zeros(grid_nums)
         dY = np.zeros(grid_nums)
+        dX_2 = np.zeros(grid_nums)
+        dY_2 = np.zeros(grid_nums)
 
         for y in range(0, grid_nums[0], 1):
             for x in range(0, grid_nums[1], 1):
@@ -131,7 +140,7 @@ class KC(object):
 
                 iw1 = img1[j - win_sizes[0]:j + win_sizes[0], i - win_sizes[1]:i + win_sizes[1]]
                 iw2 = img2[j - win_sizes[0] - search_win_sizes[0]:j + win_sizes[0] + search_win_sizes[0],
-                           i - win_sizes[1] - search_win_sizes[1]:i + win_sizes[1] + search_win_sizes[1]]
+                      i - win_sizes[1] - search_win_sizes[1]:i + win_sizes[1] + search_win_sizes[1]]
 
                 cc = cv2.matchTemplate(iw2, iw1, cv2.TM_CCOEFF_NORMED)
                 cc_max = np.max(cc)
@@ -139,6 +148,8 @@ class KC(object):
                 if cc_max > threshold:
                     y_max, x_max = np.unravel_index(np.argmax(cc),
                                                     (2 * search_win_sizes[0] + 1, 2 * search_win_sizes[1] + 1))
+                    y_max_2, x_max_2 = np.unravel_index(np.argpartition(cc.flatten(), -2)[-2],
+                                                        (2 * search_win_sizes[0] + 1, 2 * search_win_sizes[1] + 1))
 
                     # sub-pixel interpolation
                     if x_max == 0 or x_max == 2 * search_win_sizes[1] or y_max == 0 or y_max == 2 * search_win_sizes[0]:
@@ -146,6 +157,26 @@ class KC(object):
                         y_sub = 0
                     else:
                         cc_center = cc[y_max, x_max]
+                        cc_top = cc[y_max - 1, x_max]
+                        cc_bottom = cc[y_max + 1, x_max]
+                        cc_left = cc[y_max, x_max - 1]
+                        cc_right = cc[y_max, x_max + 1]
+
+                        if np.any(np.array([cc_center, cc_top, cc_bottom, cc_left, cc_right]) <= 0):
+                            x_sub = 0
+                            y_sub = 0
+                        else:
+                            x_sub = (np.log(cc_left) - np.log(cc_right)) \
+                                    / (2 * (np.log(cc_left) + np.log(cc_right) - 2 * np.log(cc_center)))
+                            y_sub = (np.log(cc_top) - np.log(cc_bottom)) \
+                                    / (2 * (np.log(cc_top) + np.log(cc_bottom) - 2 * np.log(cc_center)))
+
+                    if x_max_2 == 0 or x_max_2 == 2 * search_win_sizes[1] or y_max_2 == 0 \
+                            or y_max_2 == 2 * search_win_sizes[0]:
+                        x_sub_2 = 0
+                        y_sub_2 = 0
+                    else:
+                        cc_center = cc[y_max_2, x_max]  # TODO
                         cc_top = cc[y_max - 1, x_max]
                         cc_bottom = cc[y_max + 1, x_max]
                         cc_left = cc[y_max, x_max - 1]
@@ -169,6 +200,10 @@ class KC(object):
         return X, Y, dX, dY
 
     @staticmethod
+    def post(X, Y, dX, dY):
+        pass
+
+    @staticmethod
     def pmc(img, threshold=0.7):
         def gauss_circle(image, sd, high=255, low=0, random_sd=0):
             height, width = image.shape[:2]
@@ -189,7 +224,7 @@ class KC(object):
             for j, i in zip(ji[0], ji[1]):
                 if 0 < j < cc.shape[0] - 1 and 0 < i < cc.shape[1] - 1:
                     # judge whether peak value or not among 3x3
-                    if cc[j, i] == np.amax(cc[j-1:j+2, i-1:i+2]):
+                    if cc[j, i] == np.amax(cc[j - 1:j + 2, i - 1:i + 2]):
                         eps_x = 0.5 * (np.log(cc[j, i - 1]) - np.log(cc[j, i + 1])) \
                                 / (np.log(cc[j, i - 1]) + np.log(cc[j, i + 1]) - 2 * np.log(cc[j, i]))
                         eps_y = 0.5 * (np.log(cc[j - 1, i]) - np.log(cc[j + 1, i])) \
@@ -238,8 +273,9 @@ class KC(object):
                     (I, J+1) = (X_G3, Y_G3)  (I+1, J+1) = (X_G2, Y_G2)
 
         """
+
         def w(a, b, sigma):
-            return np.exp(-(a**2 + b**2) / sigma**2)
+            return np.exp(-(a ** 2 + b ** 2) / sigma ** 2)
 
         p_dxdy = np.zeros_like(pp)
         p = 0
@@ -258,12 +294,12 @@ class KC(object):
             # interpolation
             for j in range(0, 2):
                 for i in range(0, 2):
-                    if np.isnan(G_dX[J+j, I+i]) or np.isnan(G_dY[J+j, I+i]):
+                    if np.isnan(G_dX[J + j, I + i]) or np.isnan(G_dY[J + j, I + i]):
                         pass
                     else:
-                        p_dxdy[p, 0] += G_dX[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
-                        p_dxdy[p, 1] += G_dY[J+j, I+i] * w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
-                        W += w(a=X[I+i]-x, b=Y[J+j]-y, sigma=2)
+                        p_dxdy[p, 0] += G_dX[J + j, I + i] * w(a=X[I + i] - x, b=Y[J + j] - y, sigma=2)
+                        p_dxdy[p, 1] += G_dY[J + j, I + i] * w(a=X[I + i] - x, b=Y[J + j] - y, sigma=2)
+                        W += w(a=X[I + i] - x, b=Y[J + j] - y, sigma=2)
 
             if W == 0:
                 p_dxdy[p] = np.nan
@@ -337,7 +373,7 @@ class KC(object):
                             pp01[jj].flag = False
                             ntsp += 1
 
-        for ii in range(npa+1):
+        for ii in range(npa + 1):
             if pp01[ii].flag:
                 result[ii][0] = pp_a[pp01[ii].p0][0]
                 result[ii][1] = pp_a[pp01[ii].p0][1]
