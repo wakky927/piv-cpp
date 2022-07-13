@@ -3,11 +3,12 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import cv2
 import numpy as np
-from scipy.ndimage.filters import convolve, maximum_filter
+from scipy.ndimage.filters import maximum_filter
 from scipy.stats import norm
+from tqdm import tqdm
 
 
-class KC(object):
+class NN(object):
     """
     [Flow Chart]
 
@@ -45,121 +46,97 @@ class KC(object):
         self.n = n
 
     def run(self):
-        for i in range(1, self.n):  # 0 ~ n-1 -> range(0, self.n)
-            # read img
+        print("\n\n")
+
+        for i in tqdm(range(1, self.n)):  # 0 ~ n-1 -> range(0, self.n)
+            ############
+            # read img #
+            ############
             img_a = cv2.imread(f"{self.img_path}{self.filename}{i:06}.{self.fmt}", 0)  # 00000i -> {i:06}
             img_b = cv2.imread(f"{self.img_path}{self.filename}{i + 1:06}.{self.fmt}", 0)
 
-            # pre-processing
+            img_a = img_a[100:, 140:900]
+            img_b = img_b[100:, 140:900]
+
+            ##################
+            # pre-processing #
+            ##################
 
             # gaussian blur
-            img_a_gauss = cv2.GaussianBlur(img_a, (3, 3), 3)
-            img_b_gauss = cv2.GaussianBlur(img_b, (3, 3), 3)
-
-            roberts_cross_v = np.array([[1, 0],
-                                        [0, -1]])
-
-            roberts_cross_h = np.array([[0, 1],
-                                        [-1, 0]])
-
-            img_a_roberts = img_a.astype(np.float64) / 255.0
-            img_b_roberts = img_b.astype(np.float64) / 255.0
-
-            vertical = convolve(img_a_roberts, roberts_cross_v)
-            horizontal = convolve(img_a_roberts, roberts_cross_h)
-            edged_img_a = np.sqrt(np.square(horizontal) + np.square(vertical)) * 255
-
-            vertical = convolve(img_b_roberts, roberts_cross_v)
-            horizontal = convolve(img_b_roberts, roberts_cross_h)
-            edged_img_b = np.sqrt(np.square(horizontal) + np.square(vertical)) * 255
-
-            cv2.imwrite(f"{self.out_path}{self.filename}{i}_e.png", edged_img_a)
+            img_a_gauss = cv2.GaussianBlur(img_a, (3, 3), 0.5)
+            img_b_gauss = cv2.GaussianBlur(img_b, (3, 3), 0.5)
 
             # high-pass filter
-            kernel_high_pass = np.array([[-1, -1, -1],
-                                         [-1,  8, -1],
-                                         [-1, -1, -1]], np.float32)
+            kernel_high_pass = np.array([[-1, -1, -1, -1, -1],
+                                         [-1, -1, -1, -1, -1],
+                                         [-1, -1, 25, -1, -1],
+                                         [-1, -1, -1, -1, -1],
+                                         [-1, -1, -1, -1, -1]], np.float32)
             img_a_high_pass = cv2.filter2D(img_a_gauss, -1, kernel_high_pass)
             img_b_high_pass = cv2.filter2D(img_b_gauss, -1, kernel_high_pass)
 
-            # img_a_high_pass = self.highpass_filter(src=img_a_gauss)
-            # img_b_high_pass = self.highpass_filter(src=img_b_gauss)
-
-            cv2.imwrite(f"{self.out_path}{self.filename}{i}_highpass.png", img_a_high_pass)
-
-            # 1st std piv (cross-correlation)
+            ###########################
+            # piv (cross-correlation) #
+            ###########################
             G_X, G_Y, G_dX, G_dY, flag = self.piv(
-                img_a=edged_img_a,
-                img_b=edged_img_b,
-                grid_nums=(32, 65),  # 32, 65 (16, 33)
-                win_sizes=(16, 16),  # 16, 16 (32, 32)
-                search_win_sizes=(8, 8),  # 8, 8 (16, 16)
-                threshold=0.5,
+                img_a=img_a_high_pass,
+                img_b=img_b_high_pass,
+                grid_nums=(25, 48),
+                win_sizes=(16, 16),
+                search_win_sizes=(8, 8),
+                threshold=0.6,
             )
 
-            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_x.csv", G_X, delimiter=',')
-            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_y.csv", G_Y, delimiter=',')
-            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx.csv", G_dX, delimiter=',')
-            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy.csv", G_dY, delimiter=',')
+            # np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx.csv", G_dX, delimiter=',')
+            # np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy.csv", G_dY, delimiter=',')
 
-            # post-processing
+            ###################
+            # post-processing #
+            ###################
             G_dX, G_dY = self.post(dX=G_dX, dY=G_dY, flag=flag)
 
-            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx_2.csv", G_dX, delimiter=',')
-            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy_2.csv", G_dY, delimiter=',')
+            # np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx_2.csv", G_dX, delimiter=',')
+            # np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy_2.csv", G_dY, delimiter=',')
 
-            # pmc
-            particle_position_a = self.pmc(img=img_a, threshold=0.5)
-            particle_position_b = self.pmc(img=img_b, threshold=0.5)
+            #######
+            # pmc #
+            #######
+            particle_position_a = self.pmc(img=img_a, threshold=0.75)
+            particle_position_b = self.pmc(img=img_b, threshold=0.75)
 
-            img_a_2 = np.zeros_like(img_a)
-            img_b_2 = np.zeros_like(img_b)
+            # img_a_2 = np.zeros_like(img_a)
+            # img_b_2 = np.zeros_like(img_b)
+            #
+            # for s, t in zip(particle_position_a[:, 0].astype(int), particle_position_a[:, 1].astype(int)):
+            #     img_a_2[t, s] = 255
+            # for s, t in zip(particle_position_b[:, 0].astype(int), particle_position_b[:, 1].astype(int)):
+            #     img_b_2[t, s] = 255
 
-            for s, t in zip(particle_position_a[:, 0].astype(int), particle_position_a[:, 1].astype(int)):
-                img_a_2[t, s] = 255
-            for s, t in zip(particle_position_a[:, 0].astype(int), particle_position_a[:, 1].astype(int)):
-                img_b_2[t, s] = 255
+            # cv2.imwrite(f"{self.out_path}{self.filename}{i}.bmp", img_a_2)
+            # cv2.imwrite(f"{self.out_path}{self.filename}{i + 1}.bmp", img_b_2)
 
-            cv2.imwrite(f"{self.out_path}{self.filename}{i}.bmp", img_a_2)
-            cv2.imwrite(f"{self.out_path}{self.filename}{i + 1}.bmp", img_b_2)
-
-            # interpolation
+            #################
+            # interpolation #
+            #################
             P_dXdY = self.interpolate_vectors(G_X=G_X, G_Y=G_Y, G_dX=G_dX, G_dY=G_dY, pp=particle_position_a)
 
-            img_a_b = np.zeros_like(img_a)
-            pp = particle_position_a + P_dXdY
-            for s, t in zip(pp[:, 0].astype(int), pp[:, 1].astype(int)):
-                if 0 <= s < 256 and 0 <= t < 256:
-                    img_a_b[t, s] = 255
-            cv2.imwrite(f"{self.out_path}{self.filename}{i + 1}_pred.bmp", img_a_b)
+            # img_a_b = np.zeros_like(img_a)
+            # pp = particle_position_a + P_dXdY
+            # for s, t in zip(pp[:, 0].astype(int), pp[:, 1].astype(int)):
+            #     if 0 <= s < 256 and 0 <= t < 256:
+            #         img_a_b[t, s] = 255
 
-            # nearest-neighbor method
-            result = self.nn_method(pp_a=particle_position_a, pp_b=particle_position_b, P_dXdY=P_dXdY)
+            # cv2.imwrite(f"{self.out_path}{self.filename}{i + 1}_pred.bmp", img_a_b)
 
-            # save result
-            np.savetxt(f"{self.out_path}{self.filename}{i}.csv", result, delimiter=',', header="x, y, dX, dY")
+            ###########################
+            # nearest-neighbor method #
+            ###########################
+            result = self.nn_method(pp_a=particle_position_a, pp_b=particle_position_b, P_dXdY=P_dXdY, s=3)
 
-    @staticmethod
-    def highpass_filter(src, a=0.5):
-        # 2D FFT
-        src = np.fft.fft2(src)
-
-        h, w = src.shape
-        cy, cx = int(h/2), int(w/2)  # center
-        rh, rw = int(a*cy), int(a*cx)  # filter size
-
-        f_src = np.fft.fftshift(src)  # shift quadrant (first <-> third, second <-> forth)
-
-        f_dst = f_src.copy()
-        f_dst[cy-rh:cy+rh, cx-rw:cx+rw] = 0  # highpass filtering
-
-        f_dst = np.fft.fftshift(f_dst)  # reset quadrant
-
-        # inverse FFT
-        dst = np.fft.ifft2(f_dst)
-        dst = dst.real
-
-        return dst.astype(np.uint8)
+            ###############
+            # save result #
+            ###############
+            np.savetxt(f"{self.out_path}{self.filename}{i:06}.csv", result, delimiter=',', header="x, y, dX, dY")
 
     @staticmethod
     def detect_second_peak(arr_2d, filter_size, th):
@@ -556,7 +533,15 @@ class KC(object):
 
 
 if __name__ == '__main__':
-    kc = KC(img_path="../data/test/in/", out_path="../data/test/out/", filename="C001H001S0001", fmt="bmp", n=2)
-    kc.run()
+    # nn = NN(img_path="../data/test/in/", out_path="../data/test/out/", filename="C001H001S0001", fmt="bmp", n=2)
+
+    nn = NN(
+        img_path="E:\\M2\\original\\2022_06_22\\at_x_100_mm\\cbi\\cbi_q_2\\C001H001S0002\\",
+        out_path="E:\\M2\\result\\2022_06_22\\ptv_nn\\at_x_100_mm\\cbi\\cbi_q_2\\C001H001S0002\\",
+        filename="C001H001S0002",
+        fmt="bmp",
+        n=22500
+    )
+    nn.run()
 
     print(0)
