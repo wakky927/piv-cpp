@@ -1,7 +1,9 @@
+from copy import deepcopy
 from decimal import Decimal, ROUND_HALF_UP
 
 import cv2
 import numpy as np
+from scipy.ndimage.filters import convolve, maximum_filter
 from scipy.stats import norm
 
 
@@ -45,22 +47,54 @@ class KC(object):
     def run(self):
         for i in range(1, self.n):  # 0 ~ n-1 -> range(0, self.n)
             # read img
-            img_a = cv2.imread(f"{self.img_path}{self.filename}{i}.{self.fmt}", 0)  # 00000i -> {i:06}
-            img_b = cv2.imread(f"{self.img_path}{self.filename}{i + 1}.{self.fmt}", 0)
+            img_a = cv2.imread(f"{self.img_path}{self.filename}{i:06}.{self.fmt}", 0)  # 00000i -> {i:06}
+            img_b = cv2.imread(f"{self.img_path}{self.filename}{i + 1:06}.{self.fmt}", 0)
 
             # pre-processing
 
-            # gauss blur  TODO
-            # high-pass filter  TODO
+            # gaussian blur
+            img_a_gauss = cv2.GaussianBlur(img_a, (3, 3), 3)
+            img_b_gauss = cv2.GaussianBlur(img_b, (3, 3), 3)
 
-            # std piv (cross-correlation)
-            G_X, G_Y, G_dX, G_dY = self.std_piv(
-                img_a=img_a,
-                img_b=img_b,
-                grid_nums=(32, 65),
-                win_sizes=(16, 16),
-                search_win_sizes=(8, 8),
-                threshold=0.
+            roberts_cross_v = np.array([[1, 0],
+                                        [0, -1]])
+
+            roberts_cross_h = np.array([[0, 1],
+                                        [-1, 0]])
+
+            img_a_roberts = img_a.astype(np.float64) / 255.0
+            img_b_roberts = img_b.astype(np.float64) / 255.0
+
+            vertical = convolve(img_a_roberts, roberts_cross_v)
+            horizontal = convolve(img_a_roberts, roberts_cross_h)
+            edged_img_a = np.sqrt(np.square(horizontal) + np.square(vertical)) * 255
+
+            vertical = convolve(img_b_roberts, roberts_cross_v)
+            horizontal = convolve(img_b_roberts, roberts_cross_h)
+            edged_img_b = np.sqrt(np.square(horizontal) + np.square(vertical)) * 255
+
+            cv2.imwrite(f"{self.out_path}{self.filename}{i}_e.png", edged_img_a)
+
+            # high-pass filter
+            kernel_high_pass = np.array([[-1, -1, -1],
+                                         [-1,  8, -1],
+                                         [-1, -1, -1]], np.float32)
+            img_a_high_pass = cv2.filter2D(img_a_gauss, -1, kernel_high_pass)
+            img_b_high_pass = cv2.filter2D(img_b_gauss, -1, kernel_high_pass)
+
+            # img_a_high_pass = self.highpass_filter(src=img_a_gauss)
+            # img_b_high_pass = self.highpass_filter(src=img_b_gauss)
+
+            cv2.imwrite(f"{self.out_path}{self.filename}{i}_highpass.png", img_a_high_pass)
+
+            # 1st std piv (cross-correlation)
+            G_X, G_Y, G_dX, G_dY, flag = self.piv(
+                img_a=edged_img_a,
+                img_b=edged_img_b,
+                grid_nums=(32, 65),  # 32, 65 (16, 33)
+                win_sizes=(16, 16),  # 16, 16 (32, 32)
+                search_win_sizes=(8, 8),  # 8, 8 (16, 16)
+                threshold=0.5,
             )
 
             np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_x.csv", G_X, delimiter=',')
@@ -69,7 +103,10 @@ class KC(object):
             np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy.csv", G_dY, delimiter=',')
 
             # post-processing
-            self.post()
+            G_dX, G_dY = self.post(dX=G_dX, dY=G_dY, flag=flag)
+
+            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dx_2.csv", G_dX, delimiter=',')
+            np.savetxt(f"{self.out_path}{self.filename}{i}_std_piv_dy_2.csv", G_dY, delimiter=',')
 
             # pmc
             particle_position_a = self.pmc(img=img_a, threshold=0.5)
@@ -103,7 +140,44 @@ class KC(object):
             np.savetxt(f"{self.out_path}{self.filename}{i}.csv", result, delimiter=',', header="x, y, dX, dY")
 
     @staticmethod
-    def std_piv(img_a, img_b, grid_nums, win_sizes, search_win_sizes, threshold=0.7):
+    def highpass_filter(src, a=0.5):
+        # 2D FFT
+        src = np.fft.fft2(src)
+
+        h, w = src.shape
+        cy, cx = int(h/2), int(w/2)  # center
+        rh, rw = int(a*cy), int(a*cx)  # filter size
+
+        f_src = np.fft.fftshift(src)  # shift quadrant (first <-> third, second <-> forth)
+
+        f_dst = f_src.copy()
+        f_dst[cy-rh:cy+rh, cx-rw:cx+rw] = 0  # highpass filtering
+
+        f_dst = np.fft.fftshift(f_dst)  # reset quadrant
+
+        # inverse FFT
+        dst = np.fft.ifft2(f_dst)
+        dst = dst.real
+
+        return dst.astype(np.uint8)
+
+    @staticmethod
+    def detect_second_peak(arr_2d, filter_size, th):
+        peaks = deepcopy(arr_2d)
+
+        local_max = maximum_filter(arr_2d, footprint=np.ones((filter_size, filter_size)), mode='constant')
+        np.place(peaks, arr_2d != local_max, 0)
+        np.place(peaks, peaks < th * 0.8, 0)
+
+        if np.partition(peaks.flatten(), -2)[-2] <= 0:
+            return np.nan, np.nan
+
+        second_peak_index = np.unravel_index(np.argpartition(peaks.flatten(), -2)[-2], peaks.shape)
+
+        return second_peak_index
+
+    @staticmethod
+    def piv(img_a, img_b, grid_nums, win_sizes, search_win_sizes, threshold=0.7, r_mode=False, dx=None, dy=None):
         """
         Standard PIV (Cross-correlation)
         :param img_a: [2D ndarray (uint8)] 1st img
@@ -112,6 +186,10 @@ class KC(object):
         :param win_sizes: [tuple(int, int)] window sizes: (H, W) -> 2H * 2W
         :param search_win_sizes: [tuple(int, int)] search window sizes: (S_Y, S_X) -> H + S_Y, W + S_X
         :param threshold: [float] threshold (default 0.7)
+        :param r_mode: [bool] recursive mode (default False)
+        :param dx: [2D ndarray (float)] displacements
+        :param dy: [2D ndarray (float)] displacements
+
         :return: Y, X, dY, dX: [2D ndarray, 2D ndarray, 2D ndarray, 2D ndarray]: displacements
         """
         height, width = img_a.shape
@@ -122,86 +200,177 @@ class KC(object):
                          width + 2 * (search_win_sizes[1] + win_sizes[1]))).astype(np.uint8)
 
         img1[search_win_sizes[0] + win_sizes[0]:search_win_sizes[0] + win_sizes[0] + height,
-        search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_a
+             search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_a
         img2[search_win_sizes[0] + win_sizes[0]:search_win_sizes[0] + win_sizes[0] + height,
-        search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_b
+             search_win_sizes[1] + win_sizes[1]:search_win_sizes[1] + win_sizes[1] + width] = img_b
 
         X, Y = np.meshgrid(np.linspace(0, width, grid_nums[1], dtype="int"),
                            np.linspace(0, height, grid_nums[0], dtype="int"))
         dX = np.zeros(grid_nums)
         dY = np.zeros(grid_nums)
-        dX_2 = np.zeros(grid_nums)
-        dY_2 = np.zeros(grid_nums)
+        flag = np.zeros(grid_nums, dtype=int)
 
-        for y in range(0, grid_nums[0], 1):
-            for x in range(0, grid_nums[1], 1):
-                i = X[y, x] + search_win_sizes[1] + win_sizes[1]
-                j = Y[y, x] + search_win_sizes[0] + win_sizes[0]
+        if not r_mode:
+            for y in range(0, grid_nums[0], 1):
+                for x in range(0, grid_nums[1], 1):
+                    i = X[y, x] + search_win_sizes[1] + win_sizes[1]
+                    j = Y[y, x] + search_win_sizes[0] + win_sizes[0]
 
-                iw1 = img1[j - win_sizes[0]:j + win_sizes[0], i - win_sizes[1]:i + win_sizes[1]]
-                iw2 = img2[j - win_sizes[0] - search_win_sizes[0]:j + win_sizes[0] + search_win_sizes[0],
-                      i - win_sizes[1] - search_win_sizes[1]:i + win_sizes[1] + search_win_sizes[1]]
+                    iw1 = img1[j - win_sizes[0]:j + win_sizes[0], i - win_sizes[1]:i + win_sizes[1]]
+                    iw2 = img2[j - win_sizes[0] - search_win_sizes[0]:j + win_sizes[0] + search_win_sizes[0],
+                               i - win_sizes[1] - search_win_sizes[1]:i + win_sizes[1] + search_win_sizes[1]]
 
-                cc = cv2.matchTemplate(iw2, iw1, cv2.TM_CCOEFF_NORMED)
-                cc_max = np.max(cc)
+                    cc = cv2.matchTemplate(iw2, iw1, cv2.TM_CCOEFF_NORMED)
+                    cc_max = np.max(cc)
 
-                if cc_max > threshold:
-                    y_max, x_max = np.unravel_index(np.argmax(cc),
-                                                    (2 * search_win_sizes[0] + 1, 2 * search_win_sizes[1] + 1))
-                    y_max_2, x_max_2 = np.unravel_index(np.argpartition(cc.flatten(), -2)[-2],
-                                                        (2 * search_win_sizes[0] + 1, 2 * search_win_sizes[1] + 1))
+                    if cc_max > threshold:
+                        y_max, x_max = np.unravel_index(np.argmax(cc), cc.shape)
 
-                    # sub-pixel interpolation
-                    if x_max == 0 or x_max == 2 * search_win_sizes[1] or y_max == 0 or y_max == 2 * search_win_sizes[0]:
-                        x_sub = 0
-                        y_sub = 0
-                    else:
-                        cc_center = cc[y_max, x_max]
-                        cc_top = cc[y_max - 1, x_max]
-                        cc_bottom = cc[y_max + 1, x_max]
-                        cc_left = cc[y_max, x_max - 1]
-                        cc_right = cc[y_max, x_max + 1]
-
-                        if np.any(np.array([cc_center, cc_top, cc_bottom, cc_left, cc_right]) <= 0):
+                        # sub-pixel interpolation
+                        if x_max == 0 or x_max == 2 * search_win_sizes[1] or y_max == 0 or y_max == 2 * search_win_sizes[0]:
                             x_sub = 0
                             y_sub = 0
                         else:
-                            x_sub = (np.log(cc_left) - np.log(cc_right)) \
-                                    / (2 * (np.log(cc_left) + np.log(cc_right) - 2 * np.log(cc_center)))
-                            y_sub = (np.log(cc_top) - np.log(cc_bottom)) \
-                                    / (2 * (np.log(cc_top) + np.log(cc_bottom) - 2 * np.log(cc_center)))
+                            cc_center = cc[y_max, x_max]
+                            cc_top = cc[y_max - 1, x_max]
+                            cc_bottom = cc[y_max + 1, x_max]
+                            cc_left = cc[y_max, x_max - 1]
+                            cc_right = cc[y_max, x_max + 1]
 
-                    if x_max_2 == 0 or x_max_2 == 2 * search_win_sizes[1] or y_max_2 == 0 \
-                            or y_max_2 == 2 * search_win_sizes[0]:
-                        x_sub_2 = 0
-                        y_sub_2 = 0
+                            if np.any(np.array([cc_center, cc_top, cc_bottom, cc_left, cc_right]) <= 0):
+                                x_sub = 0
+                                y_sub = 0
+                            else:
+                                x_sub = (np.log(cc_left) - np.log(cc_right)) \
+                                        / (2 * (np.log(cc_left) + np.log(cc_right) - 2 * np.log(cc_center)))
+                                y_sub = (np.log(cc_top) - np.log(cc_bottom)) \
+                                        / (2 * (np.log(cc_top) + np.log(cc_bottom) - 2 * np.log(cc_center)))
+
+                        dX[y, x] = x_max + x_sub - search_win_sizes[1]
+                        dY[y, x] = y_max + y_sub - search_win_sizes[0]
+
                     else:
-                        cc_center = cc[y_max_2, x_max]  # TODO
-                        cc_top = cc[y_max - 1, x_max]
-                        cc_bottom = cc[y_max + 1, x_max]
-                        cc_left = cc[y_max, x_max - 1]
-                        cc_right = cc[y_max, x_max + 1]
+                        flag[y, x] = 1
 
-                        if np.any(np.array([cc_center, cc_top, cc_bottom, cc_left, cc_right]) <= 0):
-                            x_sub = 0
-                            y_sub = 0
-                        else:
-                            x_sub = (np.log(cc_left) - np.log(cc_right)) \
-                                    / (2 * (np.log(cc_left) + np.log(cc_right) - 2 * np.log(cc_center)))
-                            y_sub = (np.log(cc_top) - np.log(cc_bottom)) \
-                                    / (2 * (np.log(cc_top) + np.log(cc_bottom) - 2 * np.log(cc_center)))
+        elif r_mode and dx is not None and dy is not None:
+            for y in range(0, grid_nums[0], 1):
+                for x in range(0, grid_nums[1], 1):
+                    i = X[y, x] + search_win_sizes[1] + win_sizes[1]
+                    j = Y[y, x] + search_win_sizes[0] + win_sizes[0]
 
-                    dX[y, x] = x_max + x_sub - search_win_sizes[1]
-                    dY[y, x] = y_max + y_sub - search_win_sizes[0]
-                else:
-                    dX[y, x] = np.nan
-                    dY[y, x] = np.nan
+                    iw1 = img1[j - win_sizes[0]:j + win_sizes[0], i - win_sizes[1]:i + win_sizes[1]]
+                    iw2 = img2[j - win_sizes[0] - search_win_sizes[0]:j + win_sizes[0] + search_win_sizes[0],
+                          i - win_sizes[1] - search_win_sizes[1]:i + win_sizes[1] + search_win_sizes[1]]
 
-        return X, Y, dX, dY
+                    cc = cv2.matchTemplate(iw2, iw1, cv2.TM_CCOEFF_NORMED)
+                    cc_max = np.max(cc)
+
+        return X, Y, dX, dY, flag
 
     @staticmethod
-    def post(X, Y, dX, dY):
-        pass
+    def post(dX, dY, flag):
+        def universal_outlier_detection(dx, dy, _flag, size=1):
+            n_y, n_x = dx.shape
+            epsilon = 0.1
+
+            for m in range(0, 10, 1):
+                for y in range(size, n_y - size, 1):
+                    for x in range(size, n_x - size, 1):
+                        if _flag[y, x] == 1:
+                            continue
+
+                        dx_sub = dx[y - size:y + size + 1, x - size:x + size + 1]
+                        dy_sub = dy[y - size:y + size + 1, x - size:x + size + 1]
+                        flag_sub = _flag[y - size:y + size + 1, x - size:x + size + 1]
+
+                        mask = np.ones((2 * size + 1, 2 * size + 1))
+                        mask[flag_sub == 0] = np.nan
+                        mask[size, size] = np.nan
+
+                        dx_sub = dx_sub * mask
+                        dy_sub = dy_sub * mask
+                        flag_sub = flag_sub * mask
+
+                        if np.nansum(flag_sub) >= 3:
+                            dx_med = np.nanmedian(dx_sub)
+                            dy_med = np.nanmedian(dy_sub)
+                            rmX = np.nanmedian(np.abs(dx_sub - dx_med))
+                            rmY = np.nanmedian(np.abs(dy_sub - dy_med))
+                            r0sX = np.abs(dx[y, x] - dx_med) / (rmX + epsilon)
+                            r0sY = np.abs(dy[y, x] - dy_med) / (rmY + epsilon)
+                            r0s = np.sqrt(r0sX**2 + r0sY**2)
+
+                            if r0s > 2:
+                                dx[y, x] = np.nanmedian(dx_sub)
+                                dy[y, x] = np.nanmedian(dy_sub)
+                                _flag[y, x] = 1
+
+            return dx, dy, _flag
+
+        def quantile_outlier_detection(dx, dy, _flag, factor=1.5):
+            q1_x = np.quantile(dx, 0.25)
+            q1_y = np.quantile(dy, 0.25)
+            q3_x = np.quantile(dx, 0.75)
+            q3_y = np.quantile(dy, 0.75)
+
+            in_qr_x = q3_x - q1_x
+            in_qr_y = q3_y - q1_y
+
+            low_x = q1_x - factor * in_qr_x
+            high_x = q3_x + factor * in_qr_x
+            low_y = q1_y - factor * in_qr_y
+            high_y = q3_y + factor * in_qr_y
+
+            idx = np.where((dx < low_x) | (dx > high_x) | (dy < low_y) | (dy > high_y))
+            _flag[idx] = 1
+
+            return _flag
+
+        def interpolation(df, _flag):
+            n_y, n_x = df.shape
+
+            for m in range(0, 100, 1):
+                error_max = 0
+                idx_0 = np.where(_flag == 1)
+
+                n_0 = len(idx_0[0][:])
+
+                for n in range(n_0):
+                    x = idx_0[1][n]
+                    y = idx_0[0][n]
+
+                    if x == 0 or x == n_x - 1 or y == 0 or y == n_y - 1:
+                        continue
+
+                    elif x == 1 or x == n_x - 2 or y == 1 or y == n_y - 2:
+                        df_tmp = (df[y - 1, x] + df[y + 1, x] + df[y, x - 1] + df[y, x + 1]) / 4.0
+
+                    else:
+                        df_tmp = (df[y - 1, x] + df[y + 1, x] + df[y, x - 1] + df[y, x + 1]) / 3.0 \
+                                 - (df[y - 2, x] + df[y + 2, x] + df[y, x - 2] + df[y, x + 2]) / 12.0
+
+                    error = np.abs(df[y, x] - df_tmp)
+
+                    if error >= error_max:
+                        error_max = error
+
+                    df[y, x] = df_tmp
+                    _flag[y, x] = 0
+
+                if error_max < 0.1 and error_max != 0:
+                    break
+
+            return df, _flag
+
+        # outlier detection
+        flag = quantile_outlier_detection(dx=dX, dy=dY, _flag=flag)
+        dX, dY, flag = universal_outlier_detection(dx=dX, dy=dY, _flag=flag)
+
+        # interpolation
+        dX, _ = interpolation(df=dX, _flag=flag)
+        dY, _ = interpolation(df=dY, _flag=flag)
+
+        return dX, dY
 
     @staticmethod
     def pmc(img, threshold=0.7):
@@ -387,7 +556,7 @@ class KC(object):
 
 
 if __name__ == '__main__':
-    kc = KC(img_path="../data/test/in/", out_path="../data/test/out/", filename="", fmt="png", n=2)
+    kc = KC(img_path="../data/test/in/", out_path="../data/test/out/", filename="C001H001S0001", fmt="bmp", n=2)
     kc.run()
 
     print(0)
